@@ -1,8 +1,9 @@
 # wp2docx
 
-Sidecar container that exports every WordPress post to `.docx`, named `YYYY.MM.DD Post Title.docx`.
+Sidecar container that exports every WordPress post to `.docx`, filed as `YYYY/YYYY.MM.DD Post Title.docx`.
 Pulls posts from the WordPress REST API, converts with pandoc, and only re-exports posts that changed.
-If a post's title or date changes, the old file is replaced.
+If a post's title or date changes, the old file is replaced; if only its date's year changes, the file is moved.
+Exports from older flat-layout versions are moved into year folders on first run, not re-converted.
 
 ## How it ships
 Every push to `main` builds a multi-arch image (amd64/arm64) and publishes it to

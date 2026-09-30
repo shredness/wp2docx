@@ -148,6 +148,14 @@ def fix_perms(path: Path, mode: int):
         print(f"[warn] permissions on {path.name}: {e}", file=sys.stderr)
 
 
+def drop_if_empty(folder: Path):
+    if folder != OUT and folder.parent == OUT:
+        try:
+            folder.rmdir()                                      # only succeeds when empty
+        except OSError:
+            pass
+
+
 def run_once():
     if REFERENCE_DOCX and not Path(REFERENCE_DOCX).is_file():
         raise RuntimeError(
@@ -157,7 +165,7 @@ def run_once():
     fix_perms(OUT, 0o777)
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     claimed = {}
-    exported = skipped = 0
+    exported = skipped = moved = 0
 
     with requests.Session() as s:
         if FORWARDED_PROTO:
@@ -167,34 +175,51 @@ def run_once():
         for p in fetch_posts(s):
             pid = str(p["id"])
             title = safe_title(p["title"]["rendered"])
-            date = datetime.fromisoformat(p["date"]).strftime("%Y.%m.%d")
+            posted = datetime.fromisoformat(p["date"])
+            date = posted.strftime("%Y.%m.%d")
             name = f"{date} {title}.docx"
-            if name in claimed and claimed[name] != pid:        # same date + title collision
+            rel = f"{posted.year:04d}/{name}"                     # files live in YYYY/ subfolders
+            if rel in claimed and claimed[rel] != pid:           # same date + title collision
                 name = f"{date} {title} ({pid}).docx"
-            claimed[name] = pid
-            dest = OUT / name
+                rel = f"{posted.year:04d}/{name}"
+            claimed[rel] = pid
+            dest = OUT / rel
 
             prev = state.get(pid)
-            if prev and prev["modified"] == p["modified_gmt"] and prev["file"] == name and dest.exists():
+            if prev and prev["file"] != rel:
+                old = OUT / prev["file"]
+                if prev["modified"] == p["modified_gmt"] and old.is_file() and not dest.exists():
+                    # unchanged post, new location (flat -> year folder, or date moved years): re-file, don't re-convert
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    fix_perms(dest.parent, 0o777)
+                    old.rename(dest)
+                    drop_if_empty(old.parent)
+                    fix_perms(dest, FILE_MODE)
+                    state[pid] = {"modified": p["modified_gmt"], "file": rel}
+                    moved += 1
+                    continue
+                old.unlink(missing_ok=True)                      # title/date changed: drop the old copy
+                drop_if_empty(old.parent)
+            elif prev and prev["modified"] == p["modified_gmt"] and dest.exists():
                 fix_perms(dest, FILE_MODE)
                 skipped += 1
                 continue
-            if prev and prev["file"] != name:                   # title/date changed: drop old file
-                (OUT / prev["file"]).unlink(missing_ok=True)
 
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            fix_perms(dest.parent, 0o777)
             try:
                 to_docx(html.unescape(TAGS.sub("", p["title"]["rendered"])), p["content"]["rendered"], dest, s)
             except subprocess.CalledProcessError as e:
-                print(f"[fail] {pid} {name}: {e.stderr.strip()}", file=sys.stderr)
+                print(f"[fail] {pid} {rel}: {e.stderr.strip()}", file=sys.stderr)
                 continue
             fix_perms(dest, FILE_MODE)
-            state[pid] = {"modified": p["modified_gmt"], "file": name}
+            state[pid] = {"modified": p["modified_gmt"], "file": rel}
             exported += 1
-            print(f"[ok] {name}")
+            print(f"[ok] {rel}")
 
     STATE_FILE.write_text(json.dumps(state, indent=2))
     fix_perms(STATE_FILE, FILE_MODE)
-    print(f"exported={exported} unchanged={skipped}")
+    print(f"exported={exported} refiled={moved} unchanged={skipped}")
 
 
 if __name__ == "__main__":
