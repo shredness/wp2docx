@@ -27,3 +27,6 @@ Create a stack from `compose.yaml` and set these environment variables:
 | `REFERENCE_DOCX` | Optional Word template for styles (mount it into the container) | — |
 
 Logs show one `[ok] <filename>` per export plus an `exported=N unchanged=M` summary.
+
+Images are downloaded by the exporter and embedded in the .docx. Anything that isn't a real image
+(dead hotlinks, 404 pages) is replaced with `[image unavailable: <alt or URL>]` and logged as `[warn]`.

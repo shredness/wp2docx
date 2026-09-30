@@ -69,23 +69,71 @@ def fetch_posts(session):
         page += 1
 
 
-def to_docx(title: str, body_html: str, dest: Path):
-    if PUBLIC_URL:
-        body_html = body_html.replace(PUBLIC_URL, WP_URL)  # so pandoc can fetch images
-    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
-        f.write(f"<html><head><meta charset='utf-8'></head><body>{body_html}</body></html>")
-        src = f.name
-    tmp_out = dest.with_suffix(".docx.tmp")
-    cmd = ["pandoc", src, "-f", "html", "-t", "docx", "-o", str(tmp_out), "--no-highlight",
-           "--metadata", f"title={title}"]
-    if REFERENCE_DOCX:
-        cmd += ["--reference-doc", REFERENCE_DOCX]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        tmp_out.replace(dest)
-    finally:
-        os.unlink(src)
-        tmp_out.unlink(missing_ok=True)
+IMG_TAG = re.compile(r"<img\b[^>]*>", re.I)
+IMG_SRC = re.compile(r"""\bsrc\s*=\s*(["'])(.*?)\1""", re.I | re.S)
+IMG_ALT = re.compile(r"""\balt\s*=\s*(["'])(.*?)\1""", re.I | re.S)
+IMG_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+           "image/svg+xml": ".svg", "image/bmp": ".bmp", "image/tiff": ".tif"}
+
+
+def localize_images(body_html: str, session, workdir: Path, label: str) -> str:
+    """Download every <img> ourselves; embed real images, replace dead ones with a visible note."""
+    cache = {}
+
+    def swap(m):
+        tag = m.group(0)
+        sm = IMG_SRC.search(tag)
+        if not sm or sm.group(2).startswith("data:"):
+            return tag
+        url = html.unescape(sm.group(2)).strip()
+        if PUBLIC_URL and url.startswith(PUBLIC_URL):
+            url = WP_URL + url[len(PUBLIC_URL):]
+        elif url.startswith("//"):
+            url = "https:" + url
+        elif url.startswith("/"):
+            url = WP_URL + url
+        if url not in cache:
+            cache[url] = None
+            try:
+                r = session.get(url, timeout=30)
+                ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+                if r.ok and ctype.startswith("image/") and r.content:
+                    f = workdir / f"img{len(cache)}{IMG_EXT.get(ctype, '')}"
+                    f.write_bytes(r.content)
+                    cache[url] = f
+                else:
+                    print(f"[warn] {label}: image not usable ({r.status_code} {ctype or 'no type'}): {url}",
+                          file=sys.stderr)
+            except requests.RequestException as e:
+                print(f"[warn] {label}: image fetch failed ({e.__class__.__name__}): {url}", file=sys.stderr)
+        local = cache[url]
+        if local is None:
+            am = IMG_ALT.search(tag)
+            what = html.escape(html.unescape(am.group(2)).strip()) if am and am.group(2).strip() else html.escape(url)
+            return f"<p><em>[image unavailable: {what}]</em></p>"
+        tag = IMG_SRC.sub(lambda _: f'src="{local}"', tag, count=1)
+        return re.sub(r"""\bsrcset\s*=\s*(["']).*?\1""", "", tag, flags=re.I | re.S)
+
+    return IMG_TAG.sub(swap, body_html)
+
+
+def to_docx(title: str, body_html: str, dest: Path, session):
+    with tempfile.TemporaryDirectory() as work:
+        workdir = Path(work)
+        body_html = localize_images(body_html, session, workdir, dest.name)
+        src = workdir / "post.html"
+        src.write_text(f"<html><head><meta charset='utf-8'></head><body>{body_html}</body></html>",
+                       encoding="utf-8")
+        tmp_out = dest.with_suffix(".docx.tmp")
+        cmd = ["pandoc", str(src), "-f", "html", "-t", "docx", "-o", str(tmp_out), "--no-highlight",
+               "--metadata", f"title={title}"]
+        if REFERENCE_DOCX:
+            cmd += ["--reference-doc", REFERENCE_DOCX]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=work)
+            tmp_out.replace(dest)
+        finally:
+            tmp_out.unlink(missing_ok=True)
 
 
 def fix_perms(path: Path, mode: int):
@@ -135,7 +183,7 @@ def run_once():
                 (OUT / prev["file"]).unlink(missing_ok=True)
 
             try:
-                to_docx(html.unescape(TAGS.sub("", p["title"]["rendered"])), p["content"]["rendered"], dest)
+                to_docx(html.unescape(TAGS.sub("", p["title"]["rendered"])), p["content"]["rendered"], dest, s)
             except subprocess.CalledProcessError as e:
                 print(f"[fail] {pid} {name}: {e.stderr.strip()}", file=sys.stderr)
                 continue
