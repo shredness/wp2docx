@@ -1,0 +1,20 @@
+# Dockhand stack. Set GHCR_OWNER, WP_NETWORK and the WP_* vars in Dockhand's env section.
+services:
+  wp2docx:
+    image: ghcr.io/${GHCR_OWNER}/wp2docx:latest
+    restart: unless-stopped
+    environment:
+      WP_URL: ${WP_URL:-http://wordpress}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      WP_USER: ${WP_USER:-}
+      WP_APP_PASSWORD: ${WP_APP_PASSWORD:-}
+      WP_STATUS: ${WP_STATUS:-publish}
+      INTERVAL: ${INTERVAL:-3600}
+      REFERENCE_DOCX: ${REFERENCE_DOCX:-}
+    volumes:
+      - ${EXPORT_DIR:-/srv/exports/wordpress}:/export
+    networks: [wp]
+networks:
+  wp:
+    external: true
+    name: ${WP_NETWORK:-wordpress_default}
