@@ -15,6 +15,9 @@ services:
       PUID: ${PUID:-99}
       PGID: ${PGID:-100}
       FILE_MODE: ${FILE_MODE:-0666}
+      EXPORT_MODE: ${EXPORT_MODE:-mirror}
+      EXCLUDE_CATEGORIES: ${EXCLUDE_CATEGORIES:-}
+      EXCLUDE_TITLE_REGEX: ${EXCLUDE_TITLE_REGEX:-}
       REFERENCE_DOCX: ${REFERENCE_DOCX:-}
     volumes:
       - ${EXPORT_DIR:-/srv/exports/wordpress}:/export

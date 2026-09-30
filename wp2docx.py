@@ -29,6 +29,12 @@ FORWARDED_PROTO = os.environ.get("WP_FORWARDED_PROTO", "https")        # empty t
 PUID = os.environ.get("PUID", "99")                                    # Unraid nobody; empty to leave ownership alone
 PGID = os.environ.get("PGID", "100")                                   # Unraid users
 FILE_MODE = int(os.environ.get("FILE_MODE", "0666"), 8)                # empty not allowed; e.g. 0666 or 0777
+EXPORT_MODE = os.environ.get("EXPORT_MODE", "mirror").strip().lower()   # mirror: recreate missing files; inbox: deleted stays deleted
+EXCLUDE_CATEGORIES = [c.strip() for c in os.environ.get("EXCLUDE_CATEGORIES", "").split(",") if c.strip()]  # slugs or names
+EXCLUDE_TITLE = os.environ.get("EXCLUDE_TITLE_REGEX", "").strip()       # case-insensitive, matched against the post title
+if EXPORT_MODE not in ("mirror", "inbox"):
+    raise SystemExit(f"EXPORT_MODE must be 'mirror' or 'inbox', got {EXPORT_MODE!r}")
+EXCLUDE_TITLE_RE = re.compile(EXCLUDE_TITLE, re.I) if EXCLUDE_TITLE else None
 
 STATE_FILE = OUT / ".wp2docx_state.json"
 ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -42,7 +48,41 @@ def safe_title(raw: str) -> str:
     return t[:180] or "Untitled"
 
 
-def fetch_posts(session):
+def wp_error(r):
+    try:
+        err = r.json()
+        detail = f"{err.get('code')}: {err.get('message')}"
+    except ValueError:
+        detail = r.text[:300]
+    return RuntimeError(f"{r.status_code} from {r.url} -> {detail}")
+
+
+def excluded_category_ids(session):
+    """Resolve EXCLUDE_CATEGORIES (slugs or names, any case) to WordPress category IDs."""
+    if not EXCLUDE_CATEGORIES:
+        return []
+    cats, page = [], 1
+    while True:
+        r = session.get(f"{WP_URL}/wp-json/wp/v2/categories", params={"per_page": 100, "page": page}, timeout=60)
+        if not r.ok:
+            raise wp_error(r)
+        cats += r.json()
+        if page >= int(r.headers.get("X-WP-TotalPages", 1)):
+            break
+        page += 1
+    ids = []
+    for want in EXCLUDE_CATEGORIES:
+        hits = [c["id"] for c in cats
+                if want.lower() in (c["slug"].lower(), html.unescape(c["name"]).lower())]
+        if hits:
+            ids += hits
+        else:
+            print(f"[warn] EXCLUDE_CATEGORIES: no category named {want!r}; known: "
+                  + ", ".join(sorted(c["slug"] for c in cats)), file=sys.stderr)
+    return ids
+
+
+def fetch_posts(session, exclude_ids=()):
     auth = (WP_USER, WP_APP_PASSWORD) if WP_USER and WP_APP_PASSWORD else None
     page = 1
     while True:
@@ -50,16 +90,12 @@ def fetch_posts(session):
             f"{WP_URL}/wp-json/wp/v2/posts",
             params={"per_page": 100, "page": page, "status": STATUS,
                     "orderby": "date", "order": "asc",
-                    "context": "edit" if auth else "view"},
+                    "context": "edit" if auth else "view",
+                    **({"categories_exclude": ",".join(map(str, exclude_ids))} if exclude_ids else {})},
             auth=auth, timeout=60,
         )
         if not r.ok:
-            try:
-                err = r.json()
-                detail = f"{err.get('code')}: {err.get('message')}"
-            except ValueError:
-                detail = r.text[:300]
-            raise RuntimeError(f"{r.status_code} from {r.url} -> {detail}")
+            raise wp_error(r)
         batch = r.json()
         if not batch:
             return
@@ -165,15 +201,18 @@ def run_once():
     fix_perms(OUT, 0o777)
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     claimed = {}
-    exported = skipped = moved = 0
+    exported = skipped = moved = excluded = 0
 
     with requests.Session() as s:
         if FORWARDED_PROTO:
             # WordPress only honours Application Passwords over HTTPS; the official
             # image maps X-Forwarded-Proto to $_SERVER['HTTPS'] so plain-http internal calls still count.
             s.headers["X-Forwarded-Proto"] = FORWARDED_PROTO
-        for p in fetch_posts(s):
+        for p in fetch_posts(s, excluded_category_ids(s)):
             pid = str(p["id"])
+            if EXCLUDE_TITLE_RE and EXCLUDE_TITLE_RE.search(html.unescape(TAGS.sub("", p["title"]["rendered"]))):
+                excluded += 1
+                continue
             title = safe_title(p["title"]["rendered"])
             posted = datetime.fromisoformat(p["date"])
             date = posted.strftime("%Y.%m.%d")
@@ -188,6 +227,10 @@ def run_once():
             prev = state.get(pid)
             if prev and prev["file"] != rel:
                 old = OUT / prev["file"]
+                if prev["modified"] == p["modified_gmt"] and EXPORT_MODE == "inbox" and not old.is_file():
+                    state[pid] = {"modified": p["modified_gmt"], "file": rel}  # already exported and cleared; just track
+                    skipped += 1
+                    continue
                 if prev["modified"] == p["modified_gmt"] and old.is_file() and not dest.exists():
                     # unchanged post, new location (flat -> year folder, or date moved years): re-file, don't re-convert
                     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -200,8 +243,9 @@ def run_once():
                     continue
                 old.unlink(missing_ok=True)                      # title/date changed: drop the old copy
                 drop_if_empty(old.parent)
-            elif prev and prev["modified"] == p["modified_gmt"] and dest.exists():
-                fix_perms(dest, FILE_MODE)
+            elif prev and prev["modified"] == p["modified_gmt"] and (dest.exists() or EXPORT_MODE == "inbox"):
+                if dest.exists():
+                    fix_perms(dest, FILE_MODE)
                 skipped += 1
                 continue
 
@@ -219,12 +263,14 @@ def run_once():
 
     STATE_FILE.write_text(json.dumps(state, indent=2))
     fix_perms(STATE_FILE, FILE_MODE)
-    print(f"exported={exported} refiled={moved} unchanged={skipped}")
+    print(f"exported={exported} refiled={moved} unchanged={skipped}"
+          + (f" excluded_by_title={excluded}" if EXCLUDE_TITLE_RE else ""))
 
 
 if __name__ == "__main__":
     print(f"wp2docx start: WP_URL={WP_URL} STATUS={STATUS} OUT={OUT} "
-          f"INTERVAL={INTERVAL or 'run-once'} owner={PUID or '-'}:{PGID or '-'} mode={oct(FILE_MODE)} auth={'yes' if WP_USER and WP_APP_PASSWORD else 'no'}")
+          f"INTERVAL={INTERVAL or 'run-once'} mode={EXPORT_MODE} exclude_categories={EXCLUDE_CATEGORIES or '-'} "
+          f"exclude_title={EXCLUDE_TITLE or '-'} owner={PUID or '-'}:{PGID or '-'} mode={oct(FILE_MODE)} auth={'yes' if WP_USER and WP_APP_PASSWORD else 'no'}")
     while True:
         try:
             run_once()

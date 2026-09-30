@@ -24,6 +24,9 @@ Create a stack from `compose.yaml` and set these environment variables:
 | `INTERVAL` | Seconds between sweeps (`0` = run once and exit) | `3600` |
 | `PUID` / `PGID` | Numeric owner applied to every export (Unraid nobody:users = 99:100; empty to skip) | `99` / `100` |
 | `FILE_MODE` | Octal mode for exported files (folder always gets 0777) | `0666` |
+| `EXPORT_MODE` | `mirror`: missing files are recreated each pass. `inbox`: the tracker decides; cleared files stay gone and only new/edited posts appear | `mirror` |
+| `EXCLUDE_CATEGORIES` | Comma-separated category slugs or names never exported (e.g. `workouts`) | — |
+| `EXCLUDE_TITLE_REGEX` | Case-insensitive regex; posts whose title matches are never exported (e.g. `^workout`) | — |
 | `EXPORT_DIR` | Host folder for the .docx files | `/srv/exports/wordpress` |
 | `REFERENCE_DOCX` | Optional Word template for styles (mount it into the container) | — |
 
