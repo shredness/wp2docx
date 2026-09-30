@@ -10,6 +10,7 @@ services:
       WP_APP_PASSWORD: ${WP_APP_PASSWORD:-}
       WP_STATUS: ${WP_STATUS:-publish}
       INTERVAL: ${INTERVAL:-3600}
+      WP_FORWARDED_PROTO: ${WP_FORWARDED_PROTO:-https}
       REFERENCE_DOCX: ${REFERENCE_DOCX:-}
     volumes:
       - ${EXPORT_DIR:-/srv/exports/wordpress}:/export

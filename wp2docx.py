@@ -25,6 +25,7 @@ STATUS = os.environ.get("WP_STATUS", "publish")                        # e.g. pu
 OUT = Path(os.environ.get("OUT_DIR", "/export"))
 REFERENCE_DOCX = os.environ.get("REFERENCE_DOCX")                      # optional Word template for styles
 INTERVAL = int(os.environ.get("INTERVAL", "0"))                        # seconds; 0 = run once
+FORWARDED_PROTO = os.environ.get("WP_FORWARDED_PROTO", "https")        # empty to disable
 
 STATE_FILE = OUT / ".wp2docx_state.json"
 ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -49,7 +50,13 @@ def fetch_posts(session):
                     "context": "edit" if auth else "view"},
             auth=auth, timeout=60,
         )
-        r.raise_for_status()
+        if not r.ok:
+            try:
+                err = r.json()
+                detail = f"{err.get('code')}: {err.get('message')}"
+            except ValueError:
+                detail = r.text[:300]
+            raise RuntimeError(f"{r.status_code} from {r.url} -> {detail}")
         batch = r.json()
         if not batch:
             return
@@ -85,6 +92,10 @@ def run_once():
     exported = skipped = 0
 
     with requests.Session() as s:
+        if FORWARDED_PROTO:
+            # WordPress only honours Application Passwords over HTTPS; the official
+            # image maps X-Forwarded-Proto to $_SERVER['HTTPS'] so plain-http internal calls still count.
+            s.headers["X-Forwarded-Proto"] = FORWARDED_PROTO
         for p in fetch_posts(s):
             pid = str(p["id"])
             title = safe_title(p["title"]["rendered"])

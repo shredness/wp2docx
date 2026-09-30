@@ -19,6 +19,7 @@ Create a stack from `compose.yaml` and set these environment variables:
 | `PUBLIC_URL` | WordPress Site Address, rewritten to `WP_URL` so images embed | — |
 | `WP_USER` / `WP_APP_PASSWORD` | Application Password (needed for drafts/private) | — |
 | `WP_STATUS` | `publish`, or e.g. `publish,draft,private` | `publish` |
+| `WP_FORWARDED_PROTO` | Header telling WordPress the call is HTTPS, so Application Passwords work over internal http (empty to disable) | `https` |
 | `INTERVAL` | Seconds between sweeps (`0` = run once and exit) | `3600` |
 | `EXPORT_DIR` | Host folder for the .docx files | `/srv/exports/wordpress` |
 | `REFERENCE_DOCX` | Optional Word template for styles (mount it into the container) | — |
