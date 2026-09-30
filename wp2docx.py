@@ -26,6 +26,9 @@ OUT = Path(os.environ.get("OUT_DIR", "/export"))
 REFERENCE_DOCX = os.environ.get("REFERENCE_DOCX")                      # optional Word template for styles
 INTERVAL = int(os.environ.get("INTERVAL", "0"))                        # seconds; 0 = run once
 FORWARDED_PROTO = os.environ.get("WP_FORWARDED_PROTO", "https")        # empty to disable
+PUID = os.environ.get("PUID", "99")                                    # Unraid nobody; empty to leave ownership alone
+PGID = os.environ.get("PGID", "100")                                   # Unraid users
+FILE_MODE = int(os.environ.get("FILE_MODE", "0666"), 8)                # empty not allowed; e.g. 0666 or 0777
 
 STATE_FILE = OUT / ".wp2docx_state.json"
 ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -85,12 +88,25 @@ def to_docx(title: str, body_html: str, dest: Path):
         tmp_out.unlink(missing_ok=True)
 
 
+def fix_perms(path: Path, mode: int):
+    try:
+        if PUID and PGID:
+            st = path.stat()
+            if (st.st_uid, st.st_gid) != (int(PUID), int(PGID)):
+                os.chown(path, int(PUID), int(PGID))
+        if (path.stat().st_mode & 0o7777) != mode:
+            os.chmod(path, mode)
+    except OSError as e:
+        print(f"[warn] permissions on {path.name}: {e}", file=sys.stderr)
+
+
 def run_once():
     if REFERENCE_DOCX and not Path(REFERENCE_DOCX).is_file():
         raise RuntimeError(
             f"REFERENCE_DOCX not found at {REFERENCE_DOCX} (path inside the container; "
             f"the export folder is mounted at {OUT}) - skipping this run")
     OUT.mkdir(parents=True, exist_ok=True)
+    fix_perms(OUT, 0o777)
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     claimed = {}
     exported = skipped = 0
@@ -112,6 +128,7 @@ def run_once():
 
             prev = state.get(pid)
             if prev and prev["modified"] == p["modified_gmt"] and prev["file"] == name and dest.exists():
+                fix_perms(dest, FILE_MODE)
                 skipped += 1
                 continue
             if prev and prev["file"] != name:                   # title/date changed: drop old file
@@ -122,17 +139,19 @@ def run_once():
             except subprocess.CalledProcessError as e:
                 print(f"[fail] {pid} {name}: {e.stderr.strip()}", file=sys.stderr)
                 continue
+            fix_perms(dest, FILE_MODE)
             state[pid] = {"modified": p["modified_gmt"], "file": name}
             exported += 1
             print(f"[ok] {name}")
 
     STATE_FILE.write_text(json.dumps(state, indent=2))
+    fix_perms(STATE_FILE, FILE_MODE)
     print(f"exported={exported} unchanged={skipped}")
 
 
 if __name__ == "__main__":
     print(f"wp2docx start: WP_URL={WP_URL} STATUS={STATUS} OUT={OUT} "
-          f"INTERVAL={INTERVAL or 'run-once'} auth={'yes' if WP_USER and WP_APP_PASSWORD else 'no'}")
+          f"INTERVAL={INTERVAL or 'run-once'} owner={PUID or '-'}:{PGID or '-'} mode={oct(FILE_MODE)} auth={'yes' if WP_USER and WP_APP_PASSWORD else 'no'}")
     while True:
         try:
             run_once()

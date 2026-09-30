@@ -11,6 +11,9 @@ services:
       WP_STATUS: ${WP_STATUS:-publish}
       INTERVAL: ${INTERVAL:-3600}
       WP_FORWARDED_PROTO: ${WP_FORWARDED_PROTO:-https}
+      PUID: ${PUID:-99}
+      PGID: ${PGID:-100}
+      FILE_MODE: ${FILE_MODE:-0666}
       REFERENCE_DOCX: ${REFERENCE_DOCX:-}
     volumes:
       - ${EXPORT_DIR:-/srv/exports/wordpress}:/export

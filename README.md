@@ -21,6 +21,8 @@ Create a stack from `compose.yaml` and set these environment variables:
 | `WP_STATUS` | `publish`, or e.g. `publish,draft,private` | `publish` |
 | `WP_FORWARDED_PROTO` | Header telling WordPress the call is HTTPS, so Application Passwords work over internal http (empty to disable) | `https` |
 | `INTERVAL` | Seconds between sweeps (`0` = run once and exit) | `3600` |
+| `PUID` / `PGID` | Numeric owner applied to every export (Unraid nobody:users = 99:100; empty to skip) | `99` / `100` |
+| `FILE_MODE` | Octal mode for exported files (folder always gets 0777) | `0666` |
 | `EXPORT_DIR` | Host folder for the .docx files | `/srv/exports/wordpress` |
 | `REFERENCE_DOCX` | Optional Word template for styles (mount it into the container) | — |
 
