@@ -1,6 +1,7 @@
 # Dockhand stack. Set GHCR_OWNER, WP_NETWORK and the WP_* vars in Dockhand's env section.
 services:
   wp2docx:
+    container_name: wp2docx
     image: ghcr.io/${GHCR_OWNER}/wp2docx:latest
     restart: unless-stopped
     environment:
