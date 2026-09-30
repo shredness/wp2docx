@@ -76,7 +76,7 @@ def to_docx(title: str, body_html: str, dest: Path):
         f.write(f"<html><head><meta charset='utf-8'></head><body>{body_html}</body></html>")
         src = f.name
     tmp_out = dest.with_suffix(".docx.tmp")
-    cmd = ["pandoc", src, "-f", "html", "-t", "docx", "-o", str(tmp_out),
+    cmd = ["pandoc", src, "-f", "html", "-t", "docx", "-o", str(tmp_out), "--no-highlight",
            "--metadata", f"title={title}"]
     if REFERENCE_DOCX:
         cmd += ["--reference-doc", REFERENCE_DOCX]
