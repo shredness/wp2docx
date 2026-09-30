@@ -127,6 +127,8 @@ def run_once():
 
 
 if __name__ == "__main__":
+    print(f"wp2docx start: WP_URL={WP_URL} STATUS={STATUS} OUT={OUT} "
+          f"INTERVAL={INTERVAL or 'run-once'} auth={'yes' if WP_USER and WP_APP_PASSWORD else 'no'}")
     while True:
         try:
             run_once()
