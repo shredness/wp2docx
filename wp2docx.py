@@ -86,6 +86,10 @@ def to_docx(title: str, body_html: str, dest: Path):
 
 
 def run_once():
+    if REFERENCE_DOCX and not Path(REFERENCE_DOCX).is_file():
+        raise RuntimeError(
+            f"REFERENCE_DOCX not found at {REFERENCE_DOCX} (path inside the container; "
+            f"the export folder is mounted at {OUT}) - skipping this run")
     OUT.mkdir(parents=True, exist_ok=True)
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     claimed = {}
