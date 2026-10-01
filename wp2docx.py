@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Export WordPress posts to .docx as 'YYYY.MM.DD Post Title.docx'.
+"""Export WordPress posts to .docx, filed as 'YYYY/YYYY.MM.DD Post Title.docx'.
 
-Incremental: only re-exports posts whose modified time changed, renames the
-file if a title/date changed. Runs once, or loops if INTERVAL is set.
+Incremental: only re-converts posts whose modified time changed; moves files whose
+title/date changed; in mirror mode removes files for posts deleted or excluded in
+WordPress. Runs once, or loops every INTERVAL seconds.
 """
 import html
+from html.parser import HTMLParser
 import json
 import os
 import re
@@ -26,8 +28,8 @@ OUT = Path(os.environ.get("OUT_DIR", "/export"))
 REFERENCE_DOCX = os.environ.get("REFERENCE_DOCX")                      # optional Word template for styles
 INTERVAL = int(os.environ.get("INTERVAL", "0"))                        # seconds; 0 = run once
 FORWARDED_PROTO = os.environ.get("WP_FORWARDED_PROTO", "https")        # empty to disable
-PUID = os.environ.get("PUID", "99")                                    # Unraid nobody; empty to leave ownership alone
-PGID = os.environ.get("PGID", "100")                                   # Unraid users
+PUID = os.environ.get("PUID", "65534")                                 # Debian/OMV nobody; empty to leave ownership alone
+PGID = os.environ.get("PGID", "100")                                   # users
 FILE_MODE = int(os.environ.get("FILE_MODE", "0666"), 8)                # empty not allowed; e.g. 0666 or 0777
 EXPORT_MODE = os.environ.get("EXPORT_MODE", "mirror").strip().lower()   # mirror: recreate missing files; inbox: deleted stays deleted
 EXCLUDE_CATEGORIES = [c.strip() for c in os.environ.get("EXCLUDE_CATEGORIES", "").split(",") if c.strip()]  # slugs or names
@@ -37,6 +39,11 @@ if EXPORT_MODE not in ("mirror", "inbox"):
 EXCLUDE_TITLE_RE = re.compile(EXCLUDE_TITLE, re.I) if EXCLUDE_TITLE else None
 
 STATE_FILE = OUT / ".wp2docx_state.json"
+STATE_MODE = 0o644                                                     # never world-writable: it steers moves/deletes
+MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_MB", "25")) * 1024 * 1024
+PRUNE_GUARD = 0.5                     # refuse to prune more than this share of tracked posts in one run
+PANDOC_ENV = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": "/tmp", "LANG": "C.UTF-8"}
+perm_failures = []
 ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 TAGS = re.compile(r"<[^>]+>")
 
@@ -105,68 +112,122 @@ def fetch_posts(session, exclude_ids=()):
         page += 1
 
 
-IMG_TAG = re.compile(r"<img\b[^>]*>", re.I)
-IMG_SRC = re.compile(r"""\bsrc\s*=\s*(["'])(.*?)\1""", re.I | re.S)
-IMG_ALT = re.compile(r"""\balt\s*=\s*(["'])(.*?)\1""", re.I | re.S)
 IMG_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
            "image/svg+xml": ".svg", "image/bmp": ".bmp", "image/tiff": ".tif"}
 
 
-def localize_images(body_html: str, session, workdir: Path, label: str) -> str:
-    """Download every <img> ourselves; embed real images, replace dead ones with a visible note."""
-    cache = {}
+def fetch_image(session, url, label):
+    """Download an image with a size cap. Returns (bytes, content_type) or None."""
+    try:
+        with session.get(url, timeout=30, stream=True) as r:
+            ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if not (r.ok and ctype.startswith("image/")):
+                print(f"[warn] {label}: image not usable ({r.status_code} {ctype or 'no type'}): {url}", file=sys.stderr)
+                return None
+            buf = bytearray()
+            for chunk in r.iter_content(65536):
+                buf += chunk
+                if len(buf) > MAX_IMAGE_BYTES:
+                    print(f"[warn] {label}: image over {MAX_IMAGE_BYTES // 1048576} MB, skipped: {url}", file=sys.stderr)
+                    return None
+            return (bytes(buf), ctype) if buf else None
+    except requests.RequestException as e:
+        print(f"[warn] {label}: image fetch failed ({e.__class__.__name__}): {url}", file=sys.stderr)
+        return None
 
-    def swap(m):
-        tag = m.group(0)
-        sm = IMG_SRC.search(tag)
-        if not sm or sm.group(2).startswith("data:"):
-            return tag
-        url = html.unescape(sm.group(2)).strip()
+
+class ImageRewriter(HTMLParser):
+    """Re-emits the post HTML unchanged except: every <img> is downloaded by us and pointed at a
+    local file in the work dir (or replaced with a note), and inline <svg> is dropped. Pandoc then
+    never resolves a path or URL from post content itself, so it cannot embed container files."""
+
+    def __init__(self, session, workdir, label):
+        super().__init__(convert_charrefs=False)
+        self.session, self.workdir, self.label = session, workdir, label
+        self.out, self.cache, self.svg_depth = [], {}, 0
+
+    def resolve(self, src):
+        url = html.unescape(src).strip()
         if PUBLIC_URL and url.startswith(PUBLIC_URL):
-            url = WP_URL + url[len(PUBLIC_URL):]
-        elif url.startswith("//"):
-            url = "https:" + url
-        elif url.startswith("/"):
-            url = WP_URL + url
-        if url not in cache:
-            cache[url] = None
-            try:
-                r = session.get(url, timeout=30)
-                ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
-                if r.ok and ctype.startswith("image/") and r.content:
-                    f = workdir / f"img{len(cache)}{IMG_EXT.get(ctype, '')}"
-                    f.write_bytes(r.content)
-                    cache[url] = f
-                else:
-                    print(f"[warn] {label}: image not usable ({r.status_code} {ctype or 'no type'}): {url}",
-                          file=sys.stderr)
-            except requests.RequestException as e:
-                print(f"[warn] {label}: image fetch failed ({e.__class__.__name__}): {url}", file=sys.stderr)
-        local = cache[url]
-        if local is None:
-            am = IMG_ALT.search(tag)
-            what = html.escape(html.unescape(am.group(2)).strip()) if am and am.group(2).strip() else html.escape(url)
-            return f"<p><em>[image unavailable: {what}]</em></p>"
-        tag = IMG_SRC.sub(lambda _: f'src="{local}"', tag, count=1)
-        return re.sub(r"""\bsrcset\s*=\s*(["']).*?\1""", "", tag, flags=re.I | re.S)
+            return WP_URL + url[len(PUBLIC_URL):]
+        if url.startswith("//"):
+            return "https:" + url
+        if url.startswith("/"):
+            return WP_URL + url
+        return url if re.match(r"(?i)https?://", url) else None
 
-    return IMG_TAG.sub(swap, body_html)
+    def image(self, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        alt = html.escape(a.get("alt", "").strip(), quote=True)
+        url = self.resolve(a.get("src", ""))
+        if url and url not in self.cache:
+            got = fetch_image(self.session, url, self.label)
+            if got:
+                f = self.workdir / f"img{len(self.cache) + 1}{IMG_EXT.get(got[1], '')}"
+                f.write_bytes(got[0])
+                self.cache[url] = f.name
+            else:
+                self.cache[url] = None
+        local = self.cache.get(url) if url else None
+        if not local:
+            if not url:
+                print(f"[warn] {self.label}: image with unsupported source skipped: {a.get('src', '')[:120]}", file=sys.stderr)
+            what = alt or html.escape(a.get("src", "")[:200])
+            return f"<p><em>[image unavailable: {what}]</em></p>"
+        return f'<img src="{local}" alt="{alt}">'
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "svg":
+            self.svg_depth += 1
+        if self.svg_depth:
+            return
+        self.out.append(self.image(attrs) if tag == "img" else self.get_starttag_text())
+
+    def handle_startendtag(self, tag, attrs):
+        if self.svg_depth or tag == "svg":
+            return
+        self.out.append(self.image(attrs) if tag == "img" else self.get_starttag_text())
+
+    def handle_endtag(self, tag):
+        if tag == "svg" and self.svg_depth:
+            self.svg_depth -= 1
+            return
+        if not self.svg_depth and tag != "img":
+            self.out.append(f"</{tag}>")
+
+    def _raw(self, text):
+        if not self.svg_depth:
+            self.out.append(text)
+
+    def handle_data(self, d): self._raw(d)
+    def handle_entityref(self, n): self._raw(f"&{n};")
+    def handle_charref(self, n): self._raw(f"&#{n};")
+    def handle_comment(self, d): pass
+    def handle_decl(self, d): pass
+    def handle_pi(self, d): pass
+    def unknown_decl(self, d): pass
+
+
+def localize_images(body_html: str, session, workdir: Path, label: str) -> str:
+    rw = ImageRewriter(session, workdir, label)
+    rw.feed(body_html)
+    rw.close()
+    return "".join(rw.out)
 
 
 def to_docx(title: str, body_html: str, dest: Path, session):
     with tempfile.TemporaryDirectory() as work:
         workdir = Path(work)
         body_html = localize_images(body_html, session, workdir, dest.name)
-        src = workdir / "post.html"
-        src.write_text(f"<html><head><meta charset='utf-8'></head><body>{body_html}</body></html>",
-                       encoding="utf-8")
+        (workdir / "post.html").write_text(
+            f"<html><head><meta charset='utf-8'></head><body>{body_html}</body></html>", encoding="utf-8")
         tmp_out = dest.with_suffix(".docx.tmp")
-        cmd = ["pandoc", str(src), "-f", "html", "-t", "docx", "-o", str(tmp_out), "--no-highlight",
-               "--metadata", f"title={title}"]
+        cmd = ["pandoc", "post.html", "-f", "html", "-t", "docx", "-o", str(tmp_out), "--no-highlight",
+               "--resource-path", ".", "--metadata", f"title={title}"]
         if REFERENCE_DOCX:
             cmd += ["--reference-doc", REFERENCE_DOCX]
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=work)
+            subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=work, env=PANDOC_ENV)
             tmp_out.replace(dest)
         finally:
             tmp_out.unlink(missing_ok=True)
@@ -181,7 +242,24 @@ def fix_perms(path: Path, mode: int):
         if (path.stat().st_mode & 0o7777) != mode:
             os.chmod(path, mode)
     except OSError as e:
-        print(f"[warn] permissions on {path.name}: {e}", file=sys.stderr)
+        perm_failures.append(f"{path.name}: {e.strerror}")
+
+
+def in_out(rel: str):
+    """Resolve a state-file path, refusing anything outside the export folder."""
+    try:
+        p = (OUT / rel).resolve()
+        return p if p != OUT.resolve() and p.is_relative_to(OUT.resolve()) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(state):
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.chmod(tmp, STATE_MODE)
+    tmp.replace(STATE_FILE)
+    fix_perms(STATE_FILE, STATE_MODE)
 
 
 def drop_if_empty(folder: Path):
@@ -199,9 +277,13 @@ def run_once():
             f"the export folder is mounted at {OUT}) - skipping this run")
     OUT.mkdir(parents=True, exist_ok=True)
     fix_perms(OUT, 0o777)
-    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-    claimed = {}
-    exported = skipped = moved = excluded = 0
+    perm_failures.clear()
+    try:
+        state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    except ValueError:
+        raise RuntimeError(f"{STATE_FILE} is not valid JSON; fix or delete it (deleting forces a full re-export)")
+    claimed, seen, dirs_fixed = {}, set(), set()
+    exported = skipped = moved = excluded = pruned = 0
 
     with requests.Session() as s:
         if FORWARDED_PROTO:
@@ -213,6 +295,7 @@ def run_once():
             if EXCLUDE_TITLE_RE and EXCLUDE_TITLE_RE.search(html.unescape(TAGS.sub("", p["title"]["rendered"]))):
                 excluded += 1
                 continue
+            seen.add(pid)
             title = safe_title(p["title"]["rendered"])
             posted = datetime.fromisoformat(p["date"])
             date = posted.strftime("%Y.%m.%d")
@@ -226,7 +309,11 @@ def run_once():
 
             prev = state.get(pid)
             if prev and prev["file"] != rel:
-                old = OUT / prev["file"]
+                old = in_out(prev["file"])
+                if old is None:
+                    print(f"[warn] state entry for post {pid} points outside the export folder; ignored", file=sys.stderr)
+                    prev, old = None, None
+            if prev and prev["file"] != rel:
                 if prev["modified"] == p["modified_gmt"] and EXPORT_MODE == "inbox" and not old.is_file():
                     state[pid] = {"modified": p["modified_gmt"], "file": rel}  # already exported and cleared; just track
                     skipped += 1
@@ -245,6 +332,9 @@ def run_once():
                 drop_if_empty(old.parent)
             elif prev and prev["modified"] == p["modified_gmt"] and (dest.exists() or EXPORT_MODE == "inbox"):
                 if dest.exists():
+                    if dest.parent not in dirs_fixed:
+                        fix_perms(dest.parent, 0o777)
+                        dirs_fixed.add(dest.parent)
                     fix_perms(dest, FILE_MODE)
                 skipped += 1
                 continue
@@ -261,9 +351,24 @@ def run_once():
             exported += 1
             print(f"[ok] {rel}")
 
-    STATE_FILE.write_text(json.dumps(state, indent=2))
-    fix_perms(STATE_FILE, FILE_MODE)
-    print(f"exported={exported} refiled={moved} unchanged={skipped}"
+    # posts deleted in WordPress or newly excluded: forget them (mirror mode also removes their files)
+    gone = [pid for pid in state if pid not in seen]
+    if gone and (not seen or len(gone) > PRUNE_GUARD * len(state)):
+        print(f"[warn] {len(gone)} of {len(state)} tracked posts missing from this run; not pruning "
+              f"(check WP_STATUS, credentials and exclusions)", file=sys.stderr)
+    else:
+        for pid in gone:
+            f = in_out(state[pid].get("file", ""))
+            if EXPORT_MODE == "mirror" and f and f.is_file():
+                f.unlink()
+                drop_if_empty(f.parent)
+            del state[pid]
+            pruned += 1
+
+    save_state(state)
+    if perm_failures:
+        print(f"[warn] could not set owner/mode on {len(perm_failures)} item(s), e.g. {perm_failures[0]}", file=sys.stderr)
+    print(f"exported={exported} refiled={moved} unchanged={skipped} pruned={pruned}"
           + (f" excluded_by_title={excluded}" if EXCLUDE_TITLE_RE else ""))
 
 

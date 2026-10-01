@@ -4,6 +4,14 @@ services:
     container_name: wp2docx
     image: ghcr.io/${GHCR_OWNER}/wp2docx:latest
     restart: unless-stopped
+    # hardening: root only for the two capabilities needed to set owner/mode on exports
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt:
+      - no-new-privileges:true
     environment:
       WP_URL: ${WP_URL:-http://wordpress}
       PUBLIC_URL: ${PUBLIC_URL:-}
@@ -12,7 +20,7 @@ services:
       WP_STATUS: ${WP_STATUS:-publish}
       INTERVAL: ${INTERVAL:-3600}
       WP_FORWARDED_PROTO: ${WP_FORWARDED_PROTO:-https}
-      PUID: ${PUID:-99}
+      PUID: ${PUID:-65534}
       PGID: ${PGID:-100}
       FILE_MODE: ${FILE_MODE:-0666}
       EXPORT_MODE: ${EXPORT_MODE:-mirror}
